@@ -41,6 +41,7 @@ if __name__ == "__main__":
 
 import glob
 import hmac
+import itertools
 import io
 import json
 import os
@@ -62,6 +63,7 @@ def _log(*args):
 # ctranslate2, which LoadLibrary()s cublas64_12.dll / cudnn64_9.dll lazily).
 # ---------------------------------------------------------------------------
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 
@@ -76,9 +78,9 @@ def _add_dll_dir(d):
     return True
 
 
-def _setup_cuda_dlls():
+def _setup_gpu_dlls():
     if sys.platform != "win32":
-        return                      # no CUDA on macOS; Linux finds its libraries itself
+        return                      # no CUDA/ROCm on macOS; Linux finds its libraries itself
     found = []
     if getattr(sys, "frozen", False):
         exe_dir = os.path.dirname(os.path.abspath(sys.executable))
@@ -92,16 +94,31 @@ def _setup_cuda_dlls():
             for d in glob.glob(os.path.join(root, "nvidia", "*", "bin")):
                 if _add_dll_dir(d):
                     found.append(d)
-    if found:
-        _log("CUDA DLL dirs:", "; ".join(found))
+    # AMD ROCm
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        for d in glob.glob(os.path.join(exe_dir, "_rocm_sdk_core", "bin")) + glob.glob(os.path.join(exe_dir, "_rocm_sdk_libraries_custom", "bin")):
+            if _add_dll_dir(d):
+                found.append(d)
     else:
-        _log("no extra CUDA DLL dir found (GPU may be unavailable)")
+        roots = list(site.getsitepackages()) + [site.getusersitepackages()]
+        for root in roots:
+            for d in glob.glob(os.path.join(root, "_rocm_sdk_core", "bin")) + glob.glob(os.path.join(root, "_rocm_sdk_libraries_custom", "bin")):
+                if _add_dll_dir(d):
+                    found.append(d)
+        for d in glob.glob(r"C:\Program Files\AMD\ROCm\*\bin"):
+            if _add_dll_dir(d):
+                found.append(d)
+    if found:
+        _log("GPU DLL dirs:", "; ".join(found))
+    else:
+        _log("no extra GPU DLL dir found (GPU may be unavailable)")
 
 
-_setup_cuda_dlls()
+_setup_gpu_dlls()
 
 import numpy as np  # noqa: E402
-from faster_whisper import WhisperModel, decode_audio  # noqa: E402
+from faster_whisper import WhisperModel  # noqa: E402
 from faster_whisper.utils import _MODELS, download_model  # noqa: E402
 
 PORT = int(os.environ.get("FREEFLOW_PORT", "48123"))
@@ -205,19 +222,29 @@ def _ensure_model(name):
     return path
 
 
-def _cuda_devices():
+def _gpu_devices():
     try:
         import ctranslate2
         return ctranslate2.get_cuda_device_count()
     except Exception as e:
-        _log(f"CUDA unavailable ({type(e).__name__}: {e})")
+        _log(f"GPU unavailable ({type(e).__name__}: {e})")
         return 0
+
+def _is_rocm():
+    try:
+        import ctranslate2
+        dll = os.path.join(os.path.dirname(ctranslate2.__file__), "ctranslate2.dll")
+        data = open(dll, "rb").read().lower()
+        return (b"rocblas" in data) or (b"hipblas" in data) or (b"amdhip64" in data)
+    except Exception:
+        return False
 
 
 def _load(model_name, device, compute_type):
     path = _ensure_model(model_name)
     STATE.update(phase="loading", download=None)
-    return WhisperModel(path, device=device, compute_type=compute_type, cpu_threads=CPU_THREADS if device == "cpu" else 0)
+    return WhisperModel(path, device=device, compute_type=compute_type,
+                        cpu_threads=CPU_THREADS if device == "cpu" else 0)
 
 
 def _warm(model):
@@ -231,11 +258,23 @@ def load_model():
     global MODEL
     t0 = time.time()
     attempts = []
-    # No NVIDIA GPU: skip the large GPU model entirely (no multi-GB download for nothing).
-    if FORCE_DEVICE == "cuda" or (FORCE_DEVICE != "cpu" and _cuda_devices() > 0):
-        attempts.append((GPU_MODEL, "cuda", "float16"))
-        attempts.append((GPU_MODEL, "cuda", "int8_float16"))   # GPUs with less VRAM
-        attempts.append((GPU_MODEL, "cuda", "int8"))           # older GPUs without fast float16 (GTX 10xx)
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    gpu_count = _gpu_devices()
+    _log(f"detected {gpu_count} GPU device(s) via CTranslate2")
+    rocm = _is_rocm()
+    large_model = "large" in (GPU_MODEL or "").lower()
+    forced_ct = os.environ.get("FREEFLOW_COMPUTE_TYPE", "").strip().lower()
+    use_gpu = (FORCE_DEVICE == "cuda") or (FORCE_DEVICE != "cpu" and gpu_count > 0)
+    if rocm and large_model and FORCE_DEVICE != "cuda":
+        _log("ROCm + large model: trying GPU first; will fall back to CPU if it crashes")
+    if use_gpu:
+        if forced_ct:
+            attempts.append((GPU_MODEL, "cuda", forced_ct))
+        else:
+            attempts.append((GPU_MODEL, "cuda", "int8"))
+            attempts.append((GPU_MODEL, "cuda", "int8_float16"))
+            attempts.append((GPU_MODEL, "cuda", "float16"))
     if FORCE_DEVICE != "cuda":
         attempts.append((CPU_MODEL, "cpu", "int8"))
     last_err = None
@@ -243,7 +282,8 @@ def load_model():
         try:
             _log(f"loading {name} on {device} ({ctype})...")
             m = _load(name, device, ctype)
-            _warm(m)
+            if not (rocm and large_model):
+                _warm(m)
             MODEL = m
             STATE.update(ready=True, loading=False, phase="ready", download=None, device=device,
                          compute_type=ctype, model=name, load_ms=int((time.time() - t0) * 1000), error=None)
@@ -261,10 +301,73 @@ def load_model():
 # ---------------------------------------------------------------------------
 # Transcription
 # ---------------------------------------------------------------------------
+def _decode_audio(input_file, sampling_rate=16000):
+    """Decode any container PyAV understands (WAV, webm/opus, mp3...) to mono float32.
+
+    We deliberately do NOT use faster_whisper's decode_audio helper: that helper
+    calls av.open(..., metadata_errors="ignore"), an argument our bundled PyAV
+    does not accept, which broke meeting transcription. Decoding here keeps us
+    independent of that mismatch.
+    """
+    import av
+    import gc
+
+    if isinstance(input_file, (bytes, bytearray)):
+        input_file = io.BytesIO(input_file)
+
+    resampler = av.audio.resampler.AudioResampler(
+        format="s16", layout="mono", rate=sampling_rate)
+    raw_buffer = io.BytesIO()
+    dtype = None
+
+    with av.open(input_file, mode="r") as container:
+        frames = container.decode(audio=0)
+
+        def _ignore_invalid(it):
+            while True:
+                try:
+                    yield next(it)
+                except StopIteration:
+                    break
+                except av.error.InvalidDataError:
+                    continue
+
+        frames = _ignore_invalid(iter(frames))
+
+        fifo = av.audio.fifo.AudioFifo()
+
+        def _group(it):
+            for frame in it:
+                frame.pts = None
+                fifo.write(frame)
+                if fifo.samples >= 500000:
+                    yield fifo.read()
+            if fifo.samples > 0:
+                yield fifo.read()
+
+        frames = _group(frames)
+
+        def _resample(it):
+            for frame in itertools.chain(it, [None]):
+                yield from resampler.resample(frame)
+
+        for frame in _resample(frames):
+            array = frame.to_ndarray()
+            dtype = array.dtype
+            raw_buffer.write(array)
+
+    del resampler
+    gc.collect()
+
+    audio = np.frombuffer(raw_buffer.getbuffer(), dtype=dtype)
+    audio = audio.astype(np.float32) / 32768.0
+    return audio
+
+
 def _wav_to_float32(body):
     """Decode any container PyAV understands (WAV, webm/opus, mp3...) to 16 kHz mono."""
     try:
-        return decode_audio(io.BytesIO(body), sampling_rate=16000)
+        return _decode_audio(body, 16000)
     except Exception:
         # Fallback: plain PCM16 WAV via the wave module.
         import wave
@@ -371,7 +474,7 @@ def transcribe_meeting(req, emit):
     lang = req.get("lang") or "auto"
     language = None if lang in ("", "auto") else lang
     hints = [h.strip() for h in (req.get("hints") or []) if str(h).strip()]
-    audio = {name: decode_audio(path, sampling_rate=16000) for name, path in tracks.items()}
+    audio = {name: _decode_audio(path, 16000) for name, path in tracks.items()}
     duration = max(len(a) for a in audio.values()) / 16000.0
     total = sum(len(a) for a in audio.values()) / 16000.0 or 1.0
     mix = _write_mix(req["mix"], list(audio.values())) if req.get("mix") else None

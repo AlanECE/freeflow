@@ -115,14 +115,14 @@
     $('#set-model').value = s.model || 'auto';
     $('#model-hint').textContent = t(isMac
       ? 'Sur Mac, le modèle tourne sur le processeur : Automatique = Rapide. Sur un Mac M2 ou plus récent, essaie Équilibré.'
-      : eng.device === 'cuda' ? 'Automatique = large-v3 sur ta carte graphique.' : 'Automatique = small sur le processeur (aucune carte NVIDIA détectée).')
+      : eng.device === 'cuda' ? 'Automatique = large-v3 sur ta carte graphique.' : 'Automatique = small sur le processeur (aucun GPU utilisable détecté).')
       + ' ' + t('Un nouveau modèle se télécharge une seule fois.');
     $('#set-language').value = s.language;
     $('#set-uilang').value = lang;
     $('#set-autopaste').checked = !!s.autoPaste;
     $('#set-login').checked = !!s.launchAtLogin;
     $('#eng-state').textContent = eng.ready ? t('Prêt') : eng.loading ? (eng.phase === 'downloading' ? state.loadingLabel : t('Chargement…')) : t('Erreur');
-    $('#eng-device').textContent = eng.device ? (eng.device === 'cuda' ? 'GPU (CUDA)' : 'CPU') : '—';
+    $('#eng-device').textContent = eng.device ? (eng.device === 'cuda' ? 'GPU' : 'CPU') : '-';
     $('#eng-model').textContent = eng.model ? `faster-whisper ${eng.model}` : '—';
     $('#eng-compute').textContent = eng.compute_type || '—';
     $('#eng-port').textContent = eng.port ? `127.0.0.1:${eng.port}${eng.external ? t(' (externe)') : ''}` : '—';
